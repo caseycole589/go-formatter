@@ -36,7 +36,7 @@ func main() {
         log.Fatalf("Directory does not exist: %s", repoPath)
     }
 
-    fmt.Printf("2. Operating in : %s\n", repoPath)
+    fmt.Printf("Operating in: %s\n", repoPath)
 
     // Setup the Linter Environment
     setupToolEnvironment()
