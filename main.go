@@ -8,7 +8,6 @@ import (
     "os"
     "os/exec"
     "path/filepath"
-    "regexp"
     "runtime"
     "strings"
 )
@@ -37,7 +36,7 @@ func main() {
         log.Fatalf("Directory does not exist: %s", repoPath)
     }
 
-    fmt.Printf("Operating in: %s\n", repoPath)
+    fmt.Printf("2. Operating in : %s\n", repoPath)
 
     // Setup the Linter Environment
     setupToolEnvironment()
@@ -206,7 +205,6 @@ func runHtmlProcessing(files []string) {
         prettierBin += ".cmd"
     }
 
-    // Use the config file extracted to the tool home
     configPath := filepath.Join(toolHome, ".prettierrc")
     
     args := []string{"--write", "--config", configPath}
@@ -221,10 +219,7 @@ func runHtmlProcessing(files []string) {
         fmt.Printf("Prettier encountered a warning/error (continuing to custom formatting): %v\n", err)
     }
 
-    // Custom Regex for Allman Braces on @directives
-    regexStr := `(?m)^(\s*)(@(?:if|else|elseif|switch|for|foreach|while)\b(?:[^{]*))\s*\{`
-    re := regexp.MustCompile(regexStr)
-
+    // Process each file with custom formatting
     for _, file := range files {
         content, err := os.ReadFile(file)
         if err != nil {
@@ -233,7 +228,7 @@ func runHtmlProcessing(files []string) {
         }
 
         contentStr := string(content)
-        newContent := re.ReplaceAllString(contentStr, "$1$2\n$1{")
+        newContent := formatAngularTemplate(contentStr)
 
         if newContent != contentStr {
             if err := os.WriteFile(file, []byte(newContent), 0644); err != nil {
@@ -244,6 +239,252 @@ func runHtmlProcessing(files []string) {
     fmt.Println("HTML processing finished.")
 }
 
+// Replace your existing formatAngularTemplate function with this implementation.
+// This properly handles:
+// - Nested parentheses like adminTypes()
+// - @else and @else if patterns
+// - Multiple closing braces on one line (} } or } } })
+// - Preserves {{ }} interpolation
+// - Preserves HTML comments
+
+const indentUnit = "    " // 4 spaces - adjust if you use tabs or different spacing
+
+
+
+func formatAngularTemplate(content string) string {
+    lines := strings.Split(content, "\n")
+    var result []string
+
+    depth := 0
+    inComment := false
+
+    for _, originalLine := range lines {
+        trimmed := strings.TrimSpace(originalLine)
+        originalIndent := extractIndent(originalLine)
+
+        if trimmed == "" {
+            result = append(result, "")
+            continue
+        }
+
+        // Track multi-line HTML comments - preserve exactly
+        if strings.Contains(trimmed, "<!--") && !strings.Contains(trimmed, "-->") {
+            inComment = true
+            result = append(result, originalLine)
+            continue
+        }
+        if inComment {
+            result = append(result, originalLine)
+            if strings.Contains(trimmed, "-->") {
+                inComment = false
+            }
+            continue
+        }
+
+        // Check if this line needs expansion
+        needsExpand := (strings.Contains(trimmed, "@") && isControlFlowLine(trimmed)) ||
+            strings.Contains(trimmed, "} }")
+
+        if !needsExpand {
+            // Check for standalone }
+            if trimmed == "}" {
+                depth--
+                if depth < 0 {
+                    depth = 0
+                }
+                extraIndent := strings.Repeat(indentUnit, depth)
+                result = append(result, extraIndent+originalIndent+trimmed)
+                continue
+            }
+
+            // Regular line - add depth-based indent
+            extraIndent := strings.Repeat(indentUnit, depth)
+            result = append(result, extraIndent+originalIndent+trimmed)
+            continue
+        }
+
+        // Expand this line
+        expanded := expandLineWithIndent(trimmed, originalIndent, depth)
+
+        for _, expLine := range expanded.lines {
+            result = append(result, expLine)
+        }
+
+        depth = expanded.finalDepth
+    }
+
+    return strings.Join(result, "\n")
+}
+
+type expandResult struct {
+    lines      []string
+    finalDepth int
+}
+
+func isControlFlowLine(trimmed string) bool {
+    if (strings.Contains(trimmed, "@for") || strings.Contains(trimmed, "@if") ||
+        strings.Contains(trimmed, "@else") || strings.Contains(trimmed, "@switch")) &&
+        strings.Contains(trimmed, "{") {
+        return true
+    }
+    if strings.Contains(trimmed, "} @") {
+        return true
+    }
+    return false
+}
+
+func expandLineWithIndent(trimmed, originalIndent string, startDepth int) expandResult {
+    var result []string
+    var currentLine strings.Builder
+
+    depth := startDepth
+    localDepth := 0
+
+    i := 0
+    for i < len(trimmed) {
+        ch := trimmed[i]
+
+        // Handle {{ interpolation
+        if ch == '{' && i+1 < len(trimmed) && trimmed[i+1] == '{' {
+            currentLine.WriteString("{{")
+            i += 2
+            for i < len(trimmed) {
+                if trimmed[i] == '}' && i+1 < len(trimmed) && trimmed[i+1] == '}' {
+                    currentLine.WriteString("}}")
+                    i += 2
+                    break
+                }
+                currentLine.WriteByte(trimmed[i])
+                i++
+            }
+            continue
+        }
+
+        // Handle @directive
+        if ch == '@' && isControlFlowDirective(trimmed[i:]) {
+            flushWithDepth(&result, &currentLine, originalIndent, depth+localDepth)
+            directive, newPos := extractDirective(trimmed, i)
+            result = append(result, depthIndent(originalIndent, depth+localDepth)+directive)
+            i = newPos
+            for i < len(trimmed) && (trimmed[i] == ' ' || trimmed[i] == '\t') {
+                i++
+            }
+            if i < len(trimmed) && trimmed[i] == '{' {
+                result = append(result, depthIndent(originalIndent, depth+localDepth)+"{")
+                localDepth++
+                i++
+                for i < len(trimmed) && (trimmed[i] == ' ' || trimmed[i] == '\t') {
+                    i++
+                }
+            }
+            continue
+        }
+
+        // Handle }
+        if ch == '}' {
+            flushWithDepth(&result, &currentLine, originalIndent, depth+localDepth)
+            localDepth--
+            if depth+localDepth < 0 {
+                localDepth = -depth
+            }
+            result = append(result, depthIndent(originalIndent, depth+localDepth)+"}")
+            i++
+            for i < len(trimmed) && (trimmed[i] == ' ' || trimmed[i] == '\t') {
+                i++
+            }
+            continue
+        }
+
+        // Handle standalone {
+        if ch == '{' {
+            flushWithDepth(&result, &currentLine, originalIndent, depth+localDepth)
+            result = append(result, depthIndent(originalIndent, depth+localDepth)+"{")
+            localDepth++
+            i++
+            for i < len(trimmed) && (trimmed[i] == ' ' || trimmed[i] == '\t') {
+                i++
+            }
+            continue
+        }
+
+        currentLine.WriteByte(ch)
+        i++
+    }
+
+    flushWithDepth(&result, &currentLine, originalIndent, depth+localDepth)
+
+    if len(result) == 0 {
+        result = []string{depthIndent(originalIndent, depth) + trimmed}
+    }
+
+    return expandResult{
+        lines:      result,
+        finalDepth: depth + localDepth,
+    }
+}
+
+func depthIndent(originalIndent string, depth int) string {
+    if depth < 0 {
+        depth = 0
+    }
+    return strings.Repeat(indentUnit, depth) + originalIndent
+}
+
+func flushWithDepth(result *[]string, currentLine *strings.Builder, originalIndent string, depth int) {
+    content := strings.TrimSpace(currentLine.String())
+    if content != "" {
+        *result = append(*result, depthIndent(originalIndent, depth)+content)
+    }
+    currentLine.Reset()
+}
+
+func isControlFlowDirective(s string) bool {
+    directives := []string{"@if", "@else if", "@else", "@switch", "@case", "@default", "@for", "@empty"}
+    for _, d := range directives {
+        if strings.HasPrefix(s, d) {
+            if len(s) == len(d) {
+                return true
+            }
+            next := s[len(d)]
+            if next == ' ' || next == '(' || next == '{' || next == '\n' || next == '\t' {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+func extractDirective(line string, start int) (string, int) {
+    i := start
+    parenDepth := 0
+    inParens := false
+
+    for i < len(line) {
+        ch := line[i]
+        if ch == '(' {
+            parenDepth++
+            inParens = true
+        } else if ch == ')' {
+            parenDepth--
+            if parenDepth == 0 && inParens {
+                return line[start : i+1], i + 1
+            }
+        } else if ch == '{' && parenDepth == 0 {
+            return strings.TrimSpace(line[start:i]), i
+        }
+        i++
+    }
+    return strings.TrimSpace(line[start:]), len(line)
+}
+
+func extractIndent(line string) string {
+    for i, ch := range line {
+        if ch != ' ' && ch != '\t' {
+            return line[:i]
+        }
+    }
+    return ""
+}
 // --- UTILITIES ---
 
 func findForkPoint(currentBranch string) string {
